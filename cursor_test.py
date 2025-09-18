@@ -1,21 +1,14 @@
 from datetime import datetime
 from datetime import timedelta
+import json
 from airflow import DAG
-from airflow.contrib.hooks.bigquery_hook import BigQueryHook
-from airflow.operators.dummy_operator import DummyOperator
-from airflow.operators.python_operator import PythonOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.hooks.secret_manager import SecretsManagerHook
-from airflow.providers.google.cloud.operators.dataflow import (
-    DataflowTemplatedJobStartOperator,
-)
-
-from airflow.providers.google.cloud.operators.bigquery import (BigQueryInsertJobOperator, BigQueryDeleteTableOperator,
-                                                               BigQueryCreateEmptyTableOperator)
 from airflow.providers.google.cloud.hooks.dataflow import (
     DataflowHook,
-    process_line_and_extract_dataflow_job_id_callback,
 )
-from airflow.operators.email_operator import EmailOperator
+from airflow.operators.email import EmailOperator
 
 
 PROJECT_ID = 'vz-it-np-voev-dev-voevdo-0'
@@ -55,10 +48,9 @@ def fetch_secret(**kwargs):
     return secret_value
 
 def get_data_from_bq(**kwargs):
-    hook = BigQueryHook(gcp_conn_id=GCP_CONNECTION_ID, delegate_to=None, use_legacy_sql=False)
-    conn = hook.get_conn()
-    cursor = conn.cursor()
-    cursor.execute(f'create or replace table log_dataset.Vast_Data_backup as SELECT * FROM vz-it-np-voev-dev-voevdo-0.log_dataset.Vast_Data ')
+    hook = BigQueryHook(gcp_conn_id=GCP_CONNECTION_ID, use_legacy_sql=False)
+    client = hook.get_client(project_id=PROJECT_ID)
+    client.query('create or replace table log_dataset.Vast_Data_backup as SELECT * FROM `vz-it-np-voev-dev-voevdo-0.log_dataset.Vast_Data`').result()
     
     return True
 
@@ -71,10 +63,9 @@ data_backup = PythonOperator(
 )
 
 def truncate_table(**kwargs):
-    hook = BigQueryHook(gcp_conn_id=GCP_CONNECTION_ID, delegate_to=None, use_legacy_sql=False)
-    conn = hook.get_conn()
-    cursor = conn.cursor()
-    cursor.execute(f'delete   FROM vz-it-np-voev-dev-voevdo-0.log_dataset.Vast_Data where true')
+    hook = BigQueryHook(gcp_conn_id=GCP_CONNECTION_ID, use_legacy_sql=False)
+    client = hook.get_client(project_id=PROJECT_ID)
+    client.query('delete FROM `vz-it-np-voev-dev-voevdo-0.log_dataset.Vast_Data` where true').result()
     
     return True
 
@@ -89,6 +80,21 @@ truncate_table = PythonOperator(
 def start_dflow():
     dflow_hook = DataflowHook(gcp_conn_id='sa-vz-it-voev-voevdo-0-app')
     url = 'jdbc:sqlserver://TDCWPVASVD009:1433'
+
+    secrets_hook = SecretsManagerHook(gcp_conn_id=GCP_CONNECTION_ID)
+    secret_raw = secrets_hook.get_secret(secret_id='vastdata', secret_version='latest')
+    try:
+        creds = json.loads(secret_raw)
+        jdbc_username = creds.get('username')
+        jdbc_password = creds.get('password')
+    except Exception:
+        if isinstance(secret_raw, str) and ':' in secret_raw:
+            parts = secret_raw.split(':', 1)
+            jdbc_username = parts[0]
+            jdbc_password = parts[1]
+        else:
+            raise ValueError("Secret 'vastdata' must be JSON with username/password or 'username:password'")
+
     dflow_hook.start_template_dataflow(
     
         job_name="vastdata",
@@ -105,8 +111,8 @@ def start_dflow():
 
             "outputTable": "vz-it-np-voev-dev-voevdo-0:log_dataset.Vast_Data",
 
-            "username": username,
-            "password": password
+            "username": jdbc_username,
+            "password": jdbc_password
         },
         variables={
 
@@ -122,6 +128,7 @@ def start_dflow():
             'runner': 'DataflowRunner',
             'subnetwork': 'https://www.googleapis.com/compute/v1/projects/vz-it-np-exhv-sharedvpc-228116/regions/us-east4/subnetworks/shared-np-east-green-subnet-2'
         },
+        project_id=PROJECT_ID,
         location='us-east4'
     )
 
