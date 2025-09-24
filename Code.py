@@ -86,6 +86,58 @@ truncate_table = PythonOperator(
     dag=dag
 )
 
+# ------------------------
+# Baseline metrics helpers
+# ------------------------
+
+# Create metrics table if not exists
+create_metrics_table = BigQueryInsertJobOperator(
+    task_id='create_metrics_table',
+    configuration={
+        "query": {
+            "query": f"""
+            CREATE TABLE IF NOT EXISTS `{PROJECT_ID}.log_dataset.ITAM_AssetSoftware_Metrics` (
+              dag_id STRING,
+              run_id STRING,
+              execution_date TIMESTAMP,
+              pre_row_count INT64,
+              post_row_count INT64,
+              inserted_row_count INT64,
+              dataflow_job_id STRING,
+              duration_seconds FLOAT64,
+              status STRING,
+              created_at TIMESTAMP
+            )
+            """,
+            "useLegacySql": False,
+        }
+    },
+    location=LOCATION,
+    gcp_conn_id=GCP_CONNECTION_ID,
+    dag=dag,
+)
+
+def get_row_count_of_table(**kwargs):
+    hook = BigQueryHook(gcp_conn_id=GCP_CONNECTION_ID, delegate_to=None, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT COUNT(1) AS row_count
+        FROM `{PROJECT_ID}.log_dataset.ITAM_AssetSoftware_Data`
+        """
+    )
+    result = cursor.fetchone()
+    return int(result[0]) if result and result[0] is not None else 0
+
+pre_row_count_task = PythonOperator(
+    task_id='pre_row_count',
+    python_callable=get_row_count_of_table,
+    provide_context=True,
+    email_on_failure=True,
+    dag=dag,
+)
+
 def start_dflow():
     dflow_hook = DataflowHook(gcp_conn_id='sa-vz-it-voev-voevdo-0-app')
     url = 'jdbc:sqlserver://10.145.120.70:1433'
@@ -143,6 +195,67 @@ startdataflow = PythonOperator(
     dag=dag
 )
 
+post_row_count_task = PythonOperator(
+    task_id='post_row_count',
+    python_callable=get_row_count_of_table,
+    provide_context=True,
+    email_on_failure=True,
+    dag=dag
+)
+
+def insert_baseline_metrics(**context):
+    ti = context['ti']
+    pre_count = ti.xcom_pull(task_ids='pre_row_count') or 0
+    post_count = ti.xcom_pull(task_ids='post_row_count') or 0
+    inserted_count = int(post_count) - int(pre_count)
+
+    dag_id = context['dag'].dag_id
+    run_id = context['run_id'] if 'run_id' in context else context['dag_run'].run_id
+    execution_date = context['ts']
+
+    dataflow_job_id = ti.xcom_pull(task_ids='start_dataflow', key='dataflow_job_id')
+
+    duration_seconds = None
+    try:
+        start_ts = context.get('data_interval_start') or context.get('execution_date')
+        end_ts = context.get('data_interval_end') or datetime.utcnow()
+        if start_ts and end_ts:
+            duration_seconds = (end_ts - start_ts).total_seconds()
+    except Exception:
+        duration_seconds = None
+
+    status = 'SUCCESS'
+
+    hook = BigQueryHook(gcp_conn_id=GCP_CONNECTION_ID, delegate_to=None, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    query = f"""
+    INSERT INTO `{PROJECT_ID}.log_dataset.ITAM_AssetSoftware_Metrics`
+    (dag_id, run_id, execution_date, pre_row_count, post_row_count, inserted_row_count, dataflow_job_id, duration_seconds, status, created_at)
+    VALUES (
+      '{dag_id}',
+      '{run_id}',
+      TIMESTAMP('{execution_date}'),
+      {int(pre_count)},
+      {int(post_count)},
+      {int(inserted_count)},
+      {('NULL' if not dataflow_job_id else "'" + str(dataflow_job_id) + "'")},
+      {('NULL' if duration_seconds is None else float(duration_seconds))},
+      '{status}',
+      CURRENT_TIMESTAMP()
+    )
+    """
+    cursor.execute(query)
+    return True
+
+insert_metrics_task = PythonOperator(
+    task_id='insert_baseline_metrics',
+    python_callable=insert_baseline_metrics,
+    provide_context=True,
+    email_on_failure=True,
+    dag=dag
+)
+
 email_success = EmailOperator(
         task_id='email_success',
         to=to_email_id,
@@ -156,4 +269,4 @@ final_operator = PythonOperator(task_id='bye_task', python_callable=print_hello,
 
 
 
-hello_operator >>data_backup>>truncate_table>>startdataflow >>email_success>> final_operator
+hello_operator >> create_metrics_table >> data_backup >> pre_row_count_task >> truncate_table >> startdataflow >> post_row_count_task >> insert_metrics_task >> email_success >> final_operator
